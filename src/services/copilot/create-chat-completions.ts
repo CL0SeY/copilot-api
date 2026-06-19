@@ -114,7 +114,7 @@ export interface Delta {
     type?: "function"
     function?: {
       name?: string
-      arguments?: string
+      arguments?: string | Record<string, unknown>
     }
   }>
   reasoning_text?: string | null
@@ -125,7 +125,7 @@ export interface Delta {
 export interface Choice {
   index: number
   delta: Delta
-  finish_reason: "stop" | "length" | "tool_calls" | "content_filter" | null
+  finish_reason: string | null
   logprobs: object | null
 }
 
@@ -169,7 +169,7 @@ interface ChoiceNonStreaming {
   index: number
   message: ResponseMessage
   logprobs: object | null
-  finish_reason: "stop" | "length" | "tool_calls" | "content_filter"
+  finish_reason: string
 }
 
 // Payload types
@@ -237,7 +237,7 @@ export interface ToolCall {
   type: "function"
   function: {
     name: string
-    arguments: string
+    arguments: string | Record<string, unknown>
   }
 }
 

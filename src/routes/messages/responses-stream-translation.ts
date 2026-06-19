@@ -28,6 +28,7 @@ import {
   resolveToolUseName,
   translateResponsesResultToAnthropic,
 } from "./responses-translation"
+import { normalizePotentiallyFlattenedObject } from "./utils"
 
 const MAX_CONSECUTIVE_FUNCTION_CALL_WHITESPACE = 20
 
@@ -82,6 +83,8 @@ type FunctionCallStreamState = {
   toolCallId: string
   name: string
   consecutiveWhitespaceCount: number
+  bufferedArguments: string
+  emittedArguments: string
 }
 
 export const createResponsesStreamState = (options?: {
@@ -191,15 +194,8 @@ const handleOutputItemAdded = (
   })
 
   if (initialArguments !== undefined && initialArguments.length > 0) {
-    events.push({
-      type: "content_block_delta",
-      index: blockIndex,
-      delta: {
-        type: "input_json_delta",
-        partial_json: initialArguments,
-      },
-    })
-    state.blockHasDelta.add(blockIndex)
+    appendFunctionArgumentsBuffer(state, outputIndex, initialArguments)
+    emitBufferedFunctionArguments(state, outputIndex, blockIndex, events)
   }
 
   return events
@@ -353,15 +349,8 @@ const handleFunctionCallArgumentsDelta = (
   }
   functionCallState.consecutiveWhitespaceCount = nextCount
 
-  events.push({
-    type: "content_block_delta",
-    index: blockIndex,
-    delta: {
-      type: "input_json_delta",
-      partial_json: deltaText,
-    },
-  })
-  state.blockHasDelta.add(blockIndex)
+  appendFunctionArgumentsBuffer(state, outputIndex, deltaText)
+  emitBufferedFunctionArguments(state, outputIndex, blockIndex, events)
 
   return events
 }
@@ -379,6 +368,12 @@ const handleFunctionCallArgumentsDone = (
 
   const finalArguments =
     typeof rawEvent.arguments === "string" ? rawEvent.arguments : undefined
+
+  if (finalArguments) {
+    appendFunctionArgumentsBuffer(state, outputIndex, finalArguments)
+  }
+
+  emitBufferedFunctionArguments(state, outputIndex, blockIndex, events)
 
   if (!state.blockHasDelta.has(blockIndex) && finalArguments) {
     events.push({
@@ -784,6 +779,8 @@ const openFunctionCallBlock = (
       toolCallId: resolvedToolCallId,
       name: resolvedName,
       consecutiveWhitespaceCount: 0,
+      bufferedArguments: "",
+      emittedArguments: "",
     }
 
     state.functionCallStateByOutputIndex.set(outputIndex, functionCallState)
@@ -807,6 +804,139 @@ const openFunctionCallBlock = (
   }
 
   return blockIndex
+}
+
+const appendFunctionArgumentsBuffer = (
+  state: ResponsesStreamState,
+  outputIndex: number,
+  chunk: string,
+): void => {
+  const functionCallState =
+    state.functionCallStateByOutputIndex.get(outputIndex)
+  if (!functionCallState) {
+    return
+  }
+
+  if (!functionCallState.bufferedArguments) {
+    functionCallState.bufferedArguments = chunk
+    return
+  }
+
+  // Some providers send cumulative arguments payloads; replace instead of duplicating.
+  if (chunk.startsWith(functionCallState.bufferedArguments)) {
+    functionCallState.bufferedArguments = chunk
+    return
+  }
+
+  functionCallState.bufferedArguments += chunk
+}
+
+const emitBufferedFunctionArguments = (
+  state: ResponsesStreamState,
+  outputIndex: number,
+  blockIndex: number,
+  events: Array<AnthropicStreamEventData>,
+): void => {
+  const functionCallState =
+    state.functionCallStateByOutputIndex.get(outputIndex)
+  if (!functionCallState) {
+    return
+  }
+
+  const bufferedArguments = functionCallState.bufferedArguments
+  if (!bufferedArguments) {
+    return
+  }
+
+  const normalizedArguments =
+    normalizeToolArgumentsIfComplete(bufferedArguments)
+  if (normalizedArguments) {
+    emitFunctionArgumentsDelta(
+      normalizedArguments,
+      functionCallState,
+      blockIndex,
+      events,
+      state,
+    )
+    return
+  }
+
+  if (hasFlattenedArgumentPattern(bufferedArguments)) {
+    return
+  }
+
+  emitFunctionArgumentsDelta(
+    bufferedArguments,
+    functionCallState,
+    blockIndex,
+    events,
+    state,
+  )
+}
+
+const emitFunctionArgumentsDelta = (
+  nextArguments: string,
+  functionCallState: FunctionCallStreamState,
+  blockIndex: number,
+  events: Array<AnthropicStreamEventData>,
+  state: ResponsesStreamState,
+): void => {
+  const emittedArguments = functionCallState.emittedArguments
+
+  if (!nextArguments.startsWith(emittedArguments)) {
+    if (emittedArguments.length > 0) {
+      return
+    }
+
+    events.push({
+      type: "content_block_delta",
+      index: blockIndex,
+      delta: {
+        type: "input_json_delta",
+        partial_json: nextArguments,
+      },
+    })
+    functionCallState.emittedArguments = nextArguments
+    state.blockHasDelta.add(blockIndex)
+    return
+  }
+
+  const suffix = nextArguments.slice(emittedArguments.length)
+  if (!suffix) {
+    return
+  }
+
+  events.push({
+    type: "content_block_delta",
+    index: blockIndex,
+    delta: {
+      type: "input_json_delta",
+      partial_json: suffix,
+    },
+  })
+  functionCallState.emittedArguments = nextArguments
+  state.blockHasDelta.add(blockIndex)
+}
+
+const hasFlattenedArgumentPattern = (argumentsText: string): boolean => {
+  return /\[[0-9]+\]/.test(argumentsText)
+}
+
+const normalizeToolArgumentsIfComplete = (
+  argumentsText: string,
+): string | undefined => {
+  try {
+    const parsed = JSON.parse(argumentsText) as unknown
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return undefined
+    }
+
+    return JSON.stringify(
+      normalizePotentiallyFlattenedObject(parsed as Record<string, unknown>),
+    )
+  } catch {
+    return undefined
+  }
 }
 
 type FunctionCallDetails = {

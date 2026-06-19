@@ -47,6 +47,7 @@ import {
   type ToolChoiceFunction,
   type ToolChoiceOptions,
 } from "~/services/copilot/create-responses"
+import { normalizePotentiallyFlattenedObject } from "./utils"
 
 import {
   type AnthropicAssistantContentBlock,
@@ -1044,7 +1045,9 @@ const parseFunctionCallArguments = (
     }
 
     if (parsed && typeof parsed === "object") {
-      return parsed as Record<string, unknown>
+      return normalizePotentiallyFlattenedObject(
+        parsed as Record<string, unknown>,
+      )
     }
   } catch (error) {
     consola.warn("Failed to parse function call arguments", {

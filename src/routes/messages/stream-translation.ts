@@ -10,7 +10,10 @@ import {
   type AnthropicStreamState,
 } from "./anthropic-types"
 import { THINKING_TEXT } from "./non-stream-translation"
-import { mapOpenAIStopReasonToAnthropic } from "./utils"
+import {
+  mapOpenAIStopReasonToAnthropic,
+  normalizePotentiallyFlattenedObject,
+} from "./utils"
 
 function isToolBlockOpen(state: AnthropicStreamState): boolean {
   if (!state.contentBlockOpen) {
@@ -94,6 +97,13 @@ function handleFinish(
   if (choice.finish_reason && choice.finish_reason.length > 0) {
     if (state.contentBlockOpen) {
       const toolBlockOpen = isToolBlockOpen(state)
+      if (toolBlockOpen) {
+        flushPendingToolArgumentsForBlock(
+          state,
+          state.contentBlockIndex,
+          events,
+        )
+      }
       context.events.push({
         type: "content_block_stop",
         index: state.contentBlockIndex,
@@ -171,6 +181,11 @@ function handleToolCalls(
       if (toolCall.id && toolCall.function?.name) {
         // New tool call starting.
         if (state.contentBlockOpen) {
+          flushPendingToolArgumentsForBlock(
+            state,
+            state.contentBlockIndex,
+            events,
+          )
           // Close any previously open block.
           events.push({
             type: "content_block_stop",
@@ -185,6 +200,8 @@ function handleToolCalls(
           id: toolCall.id,
           name: toolCall.function.name,
           anthropicBlockIndex,
+          bufferedArguments: "",
+          emittedArguments: "",
         }
 
         events.push({
@@ -205,17 +222,140 @@ function handleToolCalls(
         // Tool call can still be empty
         // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
         if (toolCallInfo) {
-          events.push({
-            type: "content_block_delta",
-            index: toolCallInfo.anthropicBlockIndex,
-            delta: {
-              type: "input_json_delta",
-              partial_json: toolCall.function.arguments,
-            },
-          })
+          appendToolCallBufferedArguments(
+            toolCallInfo,
+            toolCall.function.arguments,
+          )
+          emitNormalizedToolCallArguments(toolCallInfo, events)
         }
       }
     }
+  }
+}
+
+function appendToolCallBufferedArguments(
+  toolCallInfo: AnthropicStreamState["toolCalls"][number],
+  rawArguments: string | Record<string, unknown>,
+): void {
+  const rawChunk =
+    typeof rawArguments === "string" ? rawArguments : (
+      JSON.stringify(rawArguments)
+    )
+
+  const currentBuffer = toolCallInfo.bufferedArguments ?? ""
+  if (!currentBuffer) {
+    toolCallInfo.bufferedArguments = rawChunk
+    return
+  }
+
+  // OpenAI-compatible streams may send cumulative arguments; avoid duplicating buffered content.
+  if (rawChunk.startsWith(currentBuffer)) {
+    toolCallInfo.bufferedArguments = rawChunk
+    return
+  }
+
+  toolCallInfo.bufferedArguments = `${currentBuffer}${rawChunk}`
+}
+
+function emitNormalizedToolCallArguments(
+  toolCallInfo: AnthropicStreamState["toolCalls"][number],
+  events: Array<AnthropicStreamEventData>,
+): void {
+  const normalizedArguments = normalizeToolCallArguments(
+    toolCallInfo.bufferedArguments,
+  )
+  if (!normalizedArguments) {
+    return
+  }
+
+  const emittedArguments = toolCallInfo.emittedArguments ?? ""
+  if (!normalizedArguments.startsWith(emittedArguments)) {
+    if (emittedArguments.length > 0) {
+      return
+    }
+
+    events.push({
+      type: "content_block_delta",
+      index: toolCallInfo.anthropicBlockIndex,
+      delta: {
+        type: "input_json_delta",
+        partial_json: normalizedArguments,
+      },
+    })
+    toolCallInfo.emittedArguments = normalizedArguments
+    return
+  }
+
+  const suffix = normalizedArguments.slice(emittedArguments.length)
+  if (suffix.length === 0) {
+    return
+  }
+
+  events.push({
+    type: "content_block_delta",
+    index: toolCallInfo.anthropicBlockIndex,
+    delta: {
+      type: "input_json_delta",
+      partial_json: suffix,
+    },
+  })
+  toolCallInfo.emittedArguments = normalizedArguments
+}
+
+function flushPendingToolArgumentsForBlock(
+  state: AnthropicStreamState,
+  anthropicBlockIndex: number,
+  events: Array<AnthropicStreamEventData>,
+): void {
+  const toolCallInfo = Object.values(state.toolCalls).find(
+    (toolCall) => toolCall.anthropicBlockIndex === anthropicBlockIndex,
+  )
+
+  if (!toolCallInfo) {
+    return
+  }
+
+  emitNormalizedToolCallArguments(toolCallInfo, events)
+
+  const emittedArguments = toolCallInfo.emittedArguments ?? ""
+  if (emittedArguments.length > 0) {
+    return
+  }
+
+  const fallbackArguments = toolCallInfo.bufferedArguments ?? ""
+  if (fallbackArguments.length === 0) {
+    return
+  }
+
+  events.push({
+    type: "content_block_delta",
+    index: toolCallInfo.anthropicBlockIndex,
+    delta: {
+      type: "input_json_delta",
+      partial_json: fallbackArguments,
+    },
+  })
+  toolCallInfo.emittedArguments = fallbackArguments
+}
+
+function normalizeToolCallArguments(
+  rawArguments: string | null | undefined,
+): string | undefined {
+  if (!rawArguments || rawArguments.length === 0) {
+    return undefined
+  }
+
+  try {
+    const parsed = JSON.parse(rawArguments) as unknown
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return undefined
+    }
+
+    return JSON.stringify(
+      normalizePotentiallyFlattenedObject(parsed as Record<string, unknown>),
+    )
+  } catch {
+    return undefined
   }
 }
 

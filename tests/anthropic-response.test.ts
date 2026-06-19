@@ -163,6 +163,156 @@ describe("OpenAI to Anthropic Non-Streaming Response Translation", () => {
     }
   })
 
+  test("should translate function_call finish reason to tool_use", () => {
+    const openAIResponse: ChatCompletionResponse = {
+      id: "chatcmpl-function-call",
+      object: "chat.completion",
+      created: 1677652288,
+      model: "gemini-3.1-pro-preview",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "call_fc",
+                type: "function",
+                function: {
+                  name: "search_docs",
+                  arguments: '{"query":"opencode"}',
+                },
+              },
+            ],
+          },
+          finish_reason: "function_call",
+          logprobs: null,
+        },
+      ],
+      usage: {
+        prompt_tokens: 12,
+        completion_tokens: 3,
+        total_tokens: 15,
+      },
+    }
+
+    const anthropicResponse = translateToAnthropic(openAIResponse)
+
+    expect(anthropicResponse.stop_reason).toBe("tool_use")
+    expect(anthropicResponse.content[0]?.type).toBe("tool_use")
+  })
+
+  test("should accept object tool-call arguments", () => {
+    const openAIResponse: ChatCompletionResponse = {
+      id: "chatcmpl-object-args",
+      object: "chat.completion",
+      created: 1677652288,
+      model: "gemini-3.1-pro-preview",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "call_obj",
+                type: "function",
+                function: {
+                  name: "lookup",
+                  arguments: {
+                    id: "123",
+                    scope: "full",
+                  },
+                },
+              },
+            ],
+          },
+          finish_reason: "tool_calls",
+          logprobs: null,
+        },
+      ],
+      usage: {
+        prompt_tokens: 10,
+        completion_tokens: 2,
+        total_tokens: 12,
+      },
+    }
+
+    const anthropicResponse = translateToAnthropic(openAIResponse)
+
+    expect(anthropicResponse.content[0]).toMatchObject({
+      type: "tool_use",
+      id: "call_obj",
+      name: "lookup",
+      input: {
+        id: "123",
+        scope: "full",
+      },
+    })
+  })
+
+  test("should normalize flattened tool-call keys into nested input", () => {
+    const openAIResponse: ChatCompletionResponse = {
+      id: "chatcmpl-flattened-args",
+      object: "chat.completion",
+      created: 1677652288,
+      model: "gemini-3.1-pro-preview",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "call_flat",
+                type: "function",
+                function: {
+                  name: "update_todos",
+                  arguments: JSON.stringify({
+                    "todos[0].content": "buy milk",
+                    "todos[0].done": false,
+                    "todos[1].content": "pay bills",
+                    "todos[1].done": true,
+                  }),
+                },
+              },
+            ],
+          },
+          finish_reason: "tool_calls",
+          logprobs: null,
+        },
+      ],
+      usage: {
+        prompt_tokens: 10,
+        completion_tokens: 2,
+        total_tokens: 12,
+      },
+    }
+
+    const anthropicResponse = translateToAnthropic(openAIResponse)
+
+    expect(anthropicResponse.content[0]).toMatchObject({
+      type: "tool_use",
+      id: "call_flat",
+      name: "update_todos",
+      input: {
+        todos: [
+          {
+            content: "buy milk",
+            done: false,
+          },
+          {
+            content: "pay bills",
+            done: true,
+          },
+        ],
+      },
+    })
+  })
+
   test("should translate a response stopped due to length", () => {
     const openAIResponse: ChatCompletionResponse = {
       id: "chatcmpl-789",
@@ -517,12 +667,12 @@ describe("OpenAI stream interleaved tool/content translation", () => {
       translateChunkToAnthropicEvents(chunk, streamState),
     )
 
-    const lateToolDeltaIndex = translatedStream.findIndex(
+    const normalizedToolDeltaIndex = translatedStream.findIndex(
       (event) =>
         event.type === "content_block_delta"
         && event.index === 0
         && event.delta.type === "input_json_delta"
-        && event.delta.partial_json === 'ation": "Paris"}',
+        && event.delta.partial_json === '{"location":"Paris"}',
     )
     const toolStopIndex = translatedStream.findIndex(
       (event) => event.type === "content_block_stop" && event.index === 0,
@@ -534,8 +684,8 @@ describe("OpenAI stream interleaved tool/content translation", () => {
         && event.content_block.type === "text",
     )
 
-    expect(lateToolDeltaIndex).toBeGreaterThan(-1)
-    expect(toolStopIndex).toBeGreaterThan(lateToolDeltaIndex)
+    expect(normalizedToolDeltaIndex).toBeGreaterThan(-1)
+    expect(toolStopIndex).toBeGreaterThan(normalizedToolDeltaIndex)
     expect(deferredTextStartIndex).toBeGreaterThan(toolStopIndex)
     expect(translatedStream).toContainEqual({
       type: "content_block_delta",
