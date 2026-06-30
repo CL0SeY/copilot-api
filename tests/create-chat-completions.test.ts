@@ -22,6 +22,22 @@ const fetchMock = mock(
     }
   },
 )
+
+const getPostedPayload = (): ChatCompletionsPayload => {
+  const requestOptions = fetchMock.mock.calls[0]?.[1] as
+    | { body?: string }
+    | undefined
+
+  return JSON.parse(requestOptions?.body ?? "{}") as ChatCompletionsPayload
+}
+
+const getPostedPayloadAt = (index: number): ChatCompletionsPayload => {
+  const requestOptions = fetchMock.mock.calls[index]?.[1] as
+    | { body?: string }
+    | undefined
+
+  return JSON.parse(requestOptions?.body ?? "{}") as ChatCompletionsPayload
+}
 beforeEach(() => {
   state.copilotToken = "test-token"
   state.vsCodeVersion = "1.0.0"
@@ -68,4 +84,253 @@ test("sets x-initiator to user if only user present", async () => {
     fetchMock.mock.calls[0][1] as { headers: Record<string, string> }
   ).headers
   expect(headers["x-initiator"]).toBe("user")
+})
+
+test("caps tools to 128 when request includes more tools", async () => {
+  const payload: ChatCompletionsPayload = {
+    model: "gpt-test",
+    messages: [{ role: "user", content: "hello" }],
+    tools: Array.from({ length: 129 }, (_, index) => ({
+      type: "function",
+      function: {
+        name: `tool_${index}`,
+        parameters: { type: "object" },
+      },
+    })),
+  }
+
+  await createChatCompletions(payload, { requestId: "1" })
+
+  const postedPayload = getPostedPayload()
+  expect(postedPayload.tools).toHaveLength(128)
+  expect(postedPayload.tools?.[127]?.function.name).toBe("tool_127")
+})
+
+test("keeps explicit tool_choice function when tools exceed limit", async () => {
+  const payload: ChatCompletionsPayload = {
+    model: "gpt-test",
+    messages: [{ role: "user", content: "hello" }],
+    tools: Array.from({ length: 129 }, (_, index) => ({
+      type: "function",
+      function: {
+        name: `tool_${index}`,
+        parameters: { type: "object" },
+      },
+    })),
+    tool_choice: {
+      type: "function",
+      function: { name: "tool_128" },
+    },
+  }
+
+  await createChatCompletions(payload, { requestId: "1" })
+
+  const postedPayload = getPostedPayload()
+  const toolNames = postedPayload.tools?.map((tool) => tool.function.name)
+  expect(toolNames).toContain("tool_128")
+  expect(postedPayload.tools).toHaveLength(128)
+})
+
+test("retries with compacted tools for invalid_request_body", async () => {
+  fetchMock.mockReset()
+  fetchMock
+    .mockImplementationOnce(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            error: {
+              message: "invalid request body",
+              code: "invalid_request_body",
+            },
+          }),
+          {
+            status: 400,
+            headers: {
+              "content-type": "application/json",
+            },
+          },
+        ),
+      ),
+    )
+    .mockImplementationOnce(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            id: "123",
+            object: "chat.completion",
+            choices: [],
+          }),
+          {
+            status: 200,
+            headers: {
+              "content-type": "application/json",
+            },
+          },
+        ),
+      ),
+    )
+
+  const payload: ChatCompletionsPayload = {
+    model: "gpt-test",
+    messages: [{ role: "user", content: "hello" }],
+    tools: Array.from({ length: 20 }, (_, index) => ({
+      type: "function",
+      function: {
+        name: `tool_${index}`,
+        description: `description ${index}`,
+        parameters: {
+          type: "object",
+          properties: {
+            timeout: {
+              type: "integer",
+              minimum: -9007199254740991,
+              maximum: 9007199254740991,
+            },
+          },
+        },
+      },
+    })),
+  }
+
+  await createChatCompletions(payload, { requestId: "1" })
+
+  expect(fetchMock).toHaveBeenCalledTimes(2)
+  const retriedPayload = getPostedPayloadAt(1)
+  expect(retriedPayload.tools).toHaveLength(20)
+  for (const tool of retriedPayload.tools ?? []) {
+    expect(tool.function).not.toHaveProperty("description")
+    expect(tool.function.parameters).toEqual({
+      type: "object",
+      properties: {},
+    })
+  }
+})
+
+test("retries with compacted tools when invalid_request_body omits content-type", async () => {
+  fetchMock.mockReset()
+  fetchMock
+    .mockImplementationOnce(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            error: {
+              message: "invalid request body",
+              code: "invalid_request_body",
+            },
+          }),
+          {
+            status: 400,
+          },
+        ),
+      ),
+    )
+    .mockImplementationOnce(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            id: "123",
+            object: "chat.completion",
+            choices: [],
+          }),
+          {
+            status: 200,
+          },
+        ),
+      ),
+    )
+
+  const payload: ChatCompletionsPayload = {
+    model: "gpt-test",
+    messages: [{ role: "user", content: "hello" }],
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "tool_1",
+          description: "description",
+          parameters: {
+            type: "object",
+            properties: {
+              timeout: {
+                type: "integer",
+                minimum: -9007199254740991,
+                maximum: 9007199254740991,
+              },
+            },
+          },
+        },
+      },
+    ],
+  }
+
+  await createChatCompletions(payload, { requestId: "1" })
+
+  expect(fetchMock).toHaveBeenCalledTimes(2)
+  const retriedPayload = getPostedPayloadAt(1)
+  expect(retriedPayload.tools?.[0]?.function).not.toHaveProperty("description")
+  expect(retriedPayload.tools?.[0]?.function.parameters).toEqual({
+    type: "object",
+    properties: {},
+  })
+})
+
+test("keeps Gemini tool schemas on the initial request", async () => {
+  fetchMock.mockReset()
+  fetchMock.mockImplementationOnce(() =>
+    Promise.resolve(
+      new Response(
+        JSON.stringify({
+          id: "123",
+          object: "chat.completion",
+          choices: [],
+        }),
+        {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+          },
+        },
+      ),
+    ),
+  )
+
+  const payload: ChatCompletionsPayload = {
+    model: "gemini-3-flash-preview",
+    messages: [{ role: "user", content: "hello" }],
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "tool_1",
+          description: "description",
+          parameters: {
+            type: "object",
+            properties: {
+              timeout: {
+                type: "integer",
+                minimum: -9007199254740991,
+                maximum: 9007199254740991,
+              },
+            },
+          },
+        },
+      },
+    ],
+  }
+
+  await createChatCompletions(payload, { requestId: "1" })
+
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+  const postedPayload = getPostedPayloadAt(0)
+  expect(postedPayload.tools?.[0]?.function.description).toBe("description")
+  expect(postedPayload.tools?.[0]?.function.parameters).toEqual({
+    type: "object",
+    properties: {
+      timeout: {
+        type: "integer",
+        minimum: -9007199254740991,
+        maximum: 9007199254740991,
+      },
+    },
+  })
 })

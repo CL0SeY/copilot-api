@@ -506,10 +506,58 @@ function translateAnthropicToolsToOpenAI(
 export const normalizeToolSchema = (
   schema: Record<string, unknown>,
 ): Record<string, unknown> => {
-  if (schema.type === "object" && !schema.properties) {
-    return { ...schema, properties: {} }
+  const normalizedSchema = sanitizeToolSchema(schema)
+  if (normalizedSchema.type === "object" && !normalizedSchema.properties) {
+    return { ...normalizedSchema, properties: {} }
   }
-  return schema
+  return normalizedSchema
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> => {
+  return typeof value === "object" && value !== null
+}
+
+const TOOL_SCHEMA_NUMERIC_BOUNDARY_KEYS = new Set([
+  "minimum",
+  "maximum",
+  "exclusiveMinimum",
+  "exclusiveMaximum",
+])
+
+const sanitizeToolSchema = (schema: unknown): Record<string, unknown> => {
+  if (!isRecord(schema)) {
+    return {
+      type: "object",
+      properties: {},
+    }
+  }
+
+  if (Array.isArray(schema)) {
+    return {
+      type: "object",
+      properties: {},
+    }
+  }
+
+  const result: Record<string, unknown> = {}
+
+  for (const [key, value] of Object.entries(schema)) {
+    if (TOOL_SCHEMA_NUMERIC_BOUNDARY_KEYS.has(key)) {
+      continue
+    }
+
+    if (Array.isArray(value)) {
+      const arrayValue = value as Array<unknown>
+      result[key] = arrayValue.map((item) =>
+        isRecord(item) ? sanitizeToolSchema(item) : item,
+      )
+      continue
+    }
+
+    result[key] = isRecord(value) ? sanitizeToolSchema(value) : value
+  }
+
+  return result
 }
 
 function translateAnthropicToolChoiceToOpenAI(
