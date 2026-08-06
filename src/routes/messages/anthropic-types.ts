@@ -323,6 +323,8 @@ export interface AnthropicStreamState {
       id: string
       name: string
       anthropicBlockIndex: number
+      bufferedArguments?: string
+      emittedArguments?: string
     }
   }
 }

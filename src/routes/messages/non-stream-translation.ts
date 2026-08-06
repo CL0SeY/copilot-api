@@ -28,7 +28,10 @@ import {
   type AnthropicUserContentBlock,
   type AnthropicUserMessage,
 } from "./anthropic-types"
-import { mapOpenAIStopReasonToAnthropic } from "./utils"
+import {
+  mapOpenAIStopReasonToAnthropic,
+  normalizePotentiallyFlattenedObject,
+} from "./utils"
 
 // Compatible with opencode, it will filter out blocks where the thinking text is empty, so we need add a default thinking text
 export const THINKING_TEXT = "Thinking..."
@@ -503,10 +506,58 @@ function translateAnthropicToolsToOpenAI(
 export const normalizeToolSchema = (
   schema: Record<string, unknown>,
 ): Record<string, unknown> => {
-  if (schema.type === "object" && !schema.properties) {
-    return { ...schema, properties: {} }
+  const normalizedSchema = sanitizeToolSchema(schema)
+  if (normalizedSchema.type === "object" && !normalizedSchema.properties) {
+    return { ...normalizedSchema, properties: {} }
   }
-  return schema
+  return normalizedSchema
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> => {
+  return typeof value === "object" && value !== null
+}
+
+const TOOL_SCHEMA_NUMERIC_BOUNDARY_KEYS = new Set([
+  "minimum",
+  "maximum",
+  "exclusiveMinimum",
+  "exclusiveMaximum",
+])
+
+const sanitizeToolSchema = (schema: unknown): Record<string, unknown> => {
+  if (!isRecord(schema)) {
+    return {
+      type: "object",
+      properties: {},
+    }
+  }
+
+  if (Array.isArray(schema)) {
+    return {
+      type: "object",
+      properties: {},
+    }
+  }
+
+  const result: Record<string, unknown> = {}
+
+  for (const [key, value] of Object.entries(schema)) {
+    if (TOOL_SCHEMA_NUMERIC_BOUNDARY_KEYS.has(key)) {
+      continue
+    }
+
+    if (Array.isArray(value)) {
+      const arrayValue = value as Array<unknown>
+      result[key] = arrayValue.map((item) =>
+        isRecord(item) ? sanitizeToolSchema(item) : item,
+      )
+      continue
+    }
+
+    result[key] = isRecord(value) ? sanitizeToolSchema(value) : value
+  }
+
+  return result
 }
 
 function translateAnthropicToolChoiceToOpenAI(
@@ -658,10 +709,35 @@ function getAnthropicToolUseBlocks(
   if (!toolCalls) {
     return []
   }
+
   return toolCalls.map((toolCall) => ({
     type: "tool_use",
     id: toolCall.id,
     name: toolCall.function.name,
-    input: JSON.parse(toolCall.function.arguments) as Record<string, unknown>,
+    input: normalizeToolCallInput(toolCall.function.arguments),
   }))
+}
+
+function normalizeToolCallInput(
+  rawArguments: string | Record<string, unknown> | null | undefined,
+): Record<string, unknown> {
+  if (!rawArguments) {
+    return {}
+  }
+
+  if (typeof rawArguments === "object") {
+    return normalizePotentiallyFlattenedObject(rawArguments)
+  }
+
+  try {
+    const parsed = JSON.parse(rawArguments) as unknown
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return normalizePotentiallyFlattenedObject(
+        parsed as Record<string, unknown>,
+      )
+    }
+    return {}
+  } catch {
+    return {}
+  }
 }

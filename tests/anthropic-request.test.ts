@@ -8,6 +8,7 @@ import { COMPACT_REQUEST } from "../src/lib/compact"
 import { state } from "../src/lib/state"
 import {
   RICH_TOOL_RESULT_MOVED_TEXT,
+  normalizeToolSchema,
   translateToOpenAI,
 } from "../src/routes/messages/non-stream-translation"
 import { getCompactType } from "../src/routes/messages/preprocess"
@@ -744,6 +745,46 @@ describe("provider tool result ordering", () => {
           },
         },
       ],
+    })
+  })
+})
+
+describe("tool schema normalisation", () => {
+  test("strips numeric boundary keywords from tool schemas", () => {
+    const schema = normalizeToolSchema({
+      type: "object",
+      properties: {
+        timeout: {
+          type: "integer",
+          minimum: -9007199254740991,
+          maximum: 9007199254740991,
+          exclusiveMinimum: 0,
+          exclusiveMaximum: 9007199254740991,
+          description: "timeout in milliseconds",
+        },
+      },
+      required: ["timeout"],
+    })
+
+    const timeout = (schema.properties as Record<string, unknown>).timeout as
+      | Record<string, unknown>
+      | undefined
+
+    expect(timeout?.type).toBe("integer")
+    expect(timeout?.description).toBe("timeout in milliseconds")
+    expect(timeout).not.toHaveProperty("minimum")
+    expect(timeout).not.toHaveProperty("maximum")
+    expect(timeout).not.toHaveProperty("exclusiveMinimum")
+    expect(timeout).not.toHaveProperty("exclusiveMaximum")
+  })
+
+  test("defaults invalid schemas to an empty object schema", () => {
+    // @ts-expect-error intentional invalid input
+    const schema = normalizeToolSchema(undefined)
+
+    expect(schema).toEqual({
+      type: "object",
+      properties: {},
     })
   })
 })
